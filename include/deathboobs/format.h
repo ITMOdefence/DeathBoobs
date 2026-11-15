@@ -34,5 +34,7 @@ _Static_assert(DEATHBOOBS_PAGE_PAYLOAD_SIZE == 4064,
                "DeathBoobs page payload size mismatch");
 _Static_assert(sizeof(DeathboobsPageType) == 4,
                "DeathBoobs page type ABI mismatch");
+_Static_assert(sizeof(DeathboobsPage) == DEATHBOOBS_PAGE_SIZE,
+               "DeathBoobs in-memory page size mismatch");
 
 #endif
