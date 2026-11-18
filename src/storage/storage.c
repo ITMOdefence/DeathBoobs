@@ -4,6 +4,7 @@
 #include <sys/memory.h>
 
 #include "../internal/page_codec.h"
+#include "../internal/storage_internal.h"
 #include "../internal/writer_lock.h"
 
 #define FILE_HEADER_SIZE ((u32)32)
@@ -16,6 +17,7 @@ struct DeathboobsStorage {
     DeathboobsWriterLock lock;
     String path;
     u64 page_count;
+    bool transaction_active;
     u8 scratch[DEATHBOOBS_PAGE_SIZE];
 };
 
@@ -227,6 +229,9 @@ ErrorCode deathboobs_storage_close(DeathboobsStorage **storage)
     if (!value->file || value->self.data != (u8 *)value) {
         return CORE_INVALID_STATE;
     }
+    if (value->transaction_active) {
+        return CORE_INVALID_STATE;
+    }
     error = file_flush(value->file);
     error = storage_cleanup(value, error);
     *storage = NULL;
@@ -280,6 +285,9 @@ ErrorCode deathboobs_storage_page_write(DeathboobsStorage *storage,
     if (!storage->file || storage->self.data != (u8 *)storage) {
         return CORE_INVALID_STATE;
     }
+    if (storage->transaction_active) {
+        return CORE_INVALID_STATE;
+    }
     if (page->id == 0 || page->id > storage->page_count) {
         return CORE_NOT_FOUND;
     }
@@ -300,6 +308,9 @@ ErrorCode deathboobs_storage_page_append(DeathboobsStorage *storage,
         return CORE_INVALID_ARGUMENT;
     }
     if (!storage->file || storage->self.data != (u8 *)storage) {
+        return CORE_INVALID_STATE;
+    }
+    if (storage->transaction_active) {
         return CORE_INVALID_STATE;
     }
     if (storage->page_count == (u64)0xffffffffffffffffULL) {
@@ -343,4 +354,60 @@ ErrorCode deathboobs_storage_file_identity(const DeathboobsStorage *storage,
     *out_inode = storage->lock.inode;
     *out_path = &storage->path;
     return CORE_OK;
+}
+
+ErrorCode deathboobs_storage_tx_begin(DeathboobsStorage *storage)
+{
+    if (!storage || !storage->file || storage->transaction_active) {
+        return CORE_INVALID_STATE;
+    }
+    storage->transaction_active = true;
+    return CORE_OK;
+}
+
+ErrorCode deathboobs_storage_tx_end(DeathboobsStorage *storage)
+{
+    if (!storage || !storage->file || !storage->transaction_active) {
+        return CORE_INVALID_STATE;
+    }
+    storage->transaction_active = false;
+    return CORE_OK;
+}
+
+ErrorCode deathboobs_storage_tx_page_write(DeathboobsStorage *storage,
+                                           const DeathboobsPage *page)
+{
+    ErrorCode error;
+    if (!storage || !page || !storage->file || !storage->transaction_active) {
+        return CORE_INVALID_STATE;
+    }
+    if (page->id == 0 || page->id > storage->page_count) {
+        return CORE_NOT_FOUND;
+    }
+    error = encode_page(page, storage->scratch);
+    return error == CORE_OK ? write_at(storage->file, page->id, storage->scratch)
+                            : error;
+}
+
+ErrorCode deathboobs_storage_tx_resize(DeathboobsStorage *storage,
+                                       u64 page_count)
+{
+    u64 physical_pages;
+    ErrorCode error;
+    if (!storage || !storage->file || !storage->transaction_active) {
+        return CORE_INVALID_STATE;
+    }
+    if (page_count == (u64)0xffffffffffffffffULL) {
+        return CORE_OVERFLOW;
+    }
+    physical_pages = page_count + 1;
+    if (physical_pages > (u64)ISIZE_MAX / DEATHBOOBS_PAGE_SIZE) {
+        return CORE_OVERFLOW;
+    }
+    error = deathboobs_writer_resize(
+        &storage->lock, physical_pages * DEATHBOOBS_PAGE_SIZE);
+    if (error == CORE_OK) {
+        storage->page_count = page_count;
+    }
+    return error;
 }

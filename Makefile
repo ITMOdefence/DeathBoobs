@@ -17,17 +17,19 @@ CPPFLAGS := -Iinclude \
              -I$(NATIVE_DIR)/include
 CFLAGS := -std=c11 -ffreestanding -nostdinc -fno-builtin \
           -fno-stack-protector -fno-pic -m64 -Wall -Wextra -Werror \
-          -fno-tree-loop-distribute-patterns -minline-all-stringops
+          -minline-all-stringops
 
 BUILD_DIR := build
 LIBRARY := $(BUILD_DIR)/libdeathboobs_storage.a
 STORAGE_OBJECT := $(BUILD_DIR)/storage.o
 TRANSACTION_SOURCES := src/transaction/transaction.c src/transaction/journal.c
 TRANSACTION_OBJECTS := $(BUILD_DIR)/transaction.o $(BUILD_DIR)/journal.o
+MODEL_OBJECTS := $(BUILD_DIR)/record_codec.o $(BUILD_DIR)/database.o
 INTEGRATION_OBJECT := $(BUILD_DIR)/transaction_runtime.o
 INTEGRATION_PROGRAM := $(BUILD_DIR)/transaction_runtime
 HOST_INTEGRATION := $(BUILD_DIR)/transaction_host_test
 HOST_FAULTS := $(BUILD_DIR)/transaction_fault_test
+HOST_DATABASE := $(BUILD_DIR)/database_runtime_test
 HOST_CPPFLAGS := -Itests/host/include $(CPPFLAGS)
 HOST_CFLAGS := -std=c11 -fno-builtin -Wall -Wextra -Werror
 HOST_SOURCES := src/storage/storage.c tests/host/punos_fakes.c
@@ -66,6 +68,10 @@ check-host: | $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_CPPFLAGS) $(HOST_SOURCES) $(TRANSACTION_SOURCES) \
 		tests/recovery/transaction_faults.c -o $(HOST_FAULTS)
 	$(HOST_FAULTS)
+	$(CC) $(HOST_CFLAGS) $(HOST_CPPFLAGS) $(HOST_SOURCES) $(TRANSACTION_SOURCES) \
+		src/codec/record_codec.c src/database/database.c \
+		tests/integration/database_runtime.c -o $(HOST_DATABASE)
+	$(HOST_DATABASE)
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -87,11 +93,20 @@ $(BUILD_DIR)/%.o: src/transaction/%.c src/transaction/journal.h src/internal/pag
                   include/deathboobs/format.h Makefile | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/record_codec.o: src/codec/record_codec.c include/deathboobs/record_codec.h \
+                            include/deathboobs/records.h Makefile | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/database.o: src/database/database.c include/deathboobs/database.h \
+                        include/deathboobs/record_codec.h include/deathboobs/transaction.h \
+                        Makefile | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 $(INTEGRATION_OBJECT): tests/integration/transaction_runtime.c \
                        include/deathboobs/transaction.h Makefile | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DDEATHBOOBS_NATIVE_TEST -c $< -o $@
 
-$(LIBRARY): $(STORAGE_OBJECT) $(BUILD_DIR)/writer_lock.o $(TRANSACTION_OBJECTS)
+$(LIBRARY): $(STORAGE_OBJECT) $(BUILD_DIR)/writer_lock.o $(TRANSACTION_OBJECTS) $(MODEL_OBJECTS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
@@ -106,7 +121,7 @@ $(PUNOS_FILE) $(PUNOS_STR) $(PUNOS_MEM) $(PUNOS_CORE) \
 $(PUNOS_CRT0) $(PUNOS_CRT) $(PUNOS_SYSCALL): punos-dependencies
 
 $(INTEGRATION_PROGRAM): TEST_LDFLAGS := -Wl,--wrap=file_remove \
-    -Wl,--wrap=deathboobs_storage_page_write
+    -Wl,--wrap=deathboobs_storage_tx_page_write
 
 $(TEST_PROGRAM) $(INTEGRATION_PROGRAM): %: %.o $(LIBRARY) $(PUNOS_FILE) $(PUNOS_STR) \
     $(PUNOS_MEM) $(PUNOS_CORE) $(PUNOS_CRT0) $(PUNOS_CRT) $(PUNOS_SYSCALL)

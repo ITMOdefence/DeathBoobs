@@ -5,37 +5,36 @@
 
 typedef struct DeathboobsTransaction DeathboobsTransaction;
 
-/* All journal_path arguments may be NULL to use <database path>.journal.
- * If supplied, the path must match that name byte for byte.
- */
-
-/* Opens locked Storage and runs recovery before returning it. */
+/* Opens locked Storage and completes recovery before returning it. */
 ErrorCode deathboobs_transaction_open(const String *database_path,
                                       const String *journal_path,
                                       DeathboobsStorage **out_storage);
 
-/* Begins against an open Storage. Flushes the baseline before staging writes. */
+/* Begins one transaction. journal_path may be NULL for <database>.journal. */
 ErrorCode deathboobs_transaction_begin(DeathboobsStorage *storage,
                                        const String *journal_path,
                                        DeathboobsTransaction **out_transaction);
 
-/* Stages a copy of an existing page. Repeated writes replace the staged copy. */
+/* Stages replacement of an existing page. Last write for an ID wins. */
 ErrorCode deathboobs_transaction_page_write(DeathboobsTransaction *transaction,
                                             const DeathboobsPage *page);
 
-/* On error, retains the transaction. Retry commit, or use rollback before
- * commit has entered cleanup. On success, sets *transaction to NULL.
- */
+/* Stages an appended page and returns its final physical ID. */
+ErrorCode deathboobs_transaction_page_append(DeathboobsTransaction *transaction,
+                                             const DeathboobsPage *page,
+                                             DeathboobsPageId *out_page_id);
+
+/* On success consumes the handle. On error it remains valid. */
 ErrorCode deathboobs_transaction_commit(DeathboobsTransaction **transaction);
 
-/* Cancels a transaction. If commit has entered cleanup, retry commit instead.
- * On error, retains the transaction for retry. On success, clears it.
- */
+/* Rolls back unless commit has crossed the durable cleanup phase. */
 ErrorCode deathboobs_transaction_rollback(DeathboobsTransaction **transaction);
 
-/* Restores a published journal and removes any unpublished staging file.
- * An absent journal is valid. No transaction may be active.
- */
+/* Reports whether rollback remains valid after a commit error. */
+ErrorCode deathboobs_transaction_can_rollback(
+    const DeathboobsTransaction *transaction, bool *out_can_rollback);
+
+/* Recovers a published journal and removes abandoned staging files. */
 ErrorCode deathboobs_transaction_recover(DeathboobsStorage *storage,
                                          const String *journal_path);
 

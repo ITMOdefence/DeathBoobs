@@ -1,10 +1,11 @@
 #include "journal.h"
 
 #include "../internal/page_codec.h"
+#include "../internal/storage_internal.h"
 
 #define JOURNAL_MAJOR ((u16)1)
 #define JOURNAL_MINOR ((u16)0)
-#define HEADER_CRC_OFFSET ((usize)48)
+#define HEADER_CRC_OFFSET ((usize)56)
 
 static const u8 MAGIC[8] = {'D', 'B', 'J', 'R', 'N', 'L', 0, 0};
 static const char JOURNAL_SUFFIX[] = ".journal";
@@ -120,7 +121,8 @@ ErrorCode journal_sync_directory(const Journal *journal)
     return journal_close(&directory, error);
 }
 
-ErrorCode journal_write_header(FileHandle file, const Journal *journal, u64 count)
+ErrorCode journal_write_header(FileHandle file, const Journal *journal,
+                               u64 original_count, u64 final_page_count)
 {
     u8 header[JOURNAL_HEADER_SIZE] = {0};
     for (usize i = 0; i < sizeof(MAGIC); ++i) {
@@ -132,7 +134,8 @@ ErrorCode journal_write_header(FileHandle file, const Journal *journal, u64 coun
     put_u64_le(header + 16, journal->device);
     put_u64_le(header + 24, journal->inode);
     put_u64_le(header + 32, journal->page_count);
-    put_u64_le(header + 40, count);
+    put_u64_le(header + 40, original_count);
+    put_u64_le(header + 48, final_page_count);
     put_u32_le(header + HEADER_CRC_OFFSET, crc32(header, sizeof(header)));
     return file_write_all(file, (Bytes){header, sizeof(header)});
 }
@@ -166,12 +169,16 @@ static ErrorCode read_exact(FileHandle file, u8 *data, usize size)
     return CORE_OK;
 }
 
-static ErrorCode read_header(FileHandle file, const Journal *journal, u64 *out_count)
+static ErrorCode read_header(FileHandle file, const Journal *journal,
+                             u64 *out_baseline, u64 *out_count,
+                             u64 *out_final)
 {
     FileInfo info;
     u8 header[JOURNAL_HEADER_SIZE];
     u32 stored_crc;
+    u64 baseline;
     u64 count;
+    u64 final_count;
     ErrorCode error = file_info(file, &info);
     if (error != CORE_OK) {
         return error;
@@ -202,14 +209,18 @@ static ErrorCode read_header(FileHandle file, const Journal *journal, u64 *out_c
         get_u64_le(header + 24) != journal->inode) {
         return CORE_INVALID_STATE;
     }
+    baseline = get_u64_le(header + 32);
     count = get_u64_le(header + 40);
-    if (!bytes_are_zero(header + 52, 4) ||
-        get_u64_le(header + 32) != journal->page_count ||
-        count == 0 || count > journal->page_count || count > JOURNAL_MAX_RECORDS ||
+    final_count = get_u64_le(header + 48);
+    if (!bytes_are_zero(header + 60, 4) || baseline > final_count ||
+        journal->page_count < baseline || journal->page_count > final_count ||
+        count > baseline || count > JOURNAL_MAX_RECORDS ||
         info.size != JOURNAL_HEADER_SIZE + count * DEATHBOOBS_PAGE_SIZE) {
         return CORE_IO_ERROR;
     }
+    *out_baseline = baseline;
     *out_count = count;
+    *out_final = final_count;
     return CORE_OK;
 }
 
@@ -230,7 +241,7 @@ static ErrorCode visit_records(FileHandle file, u64 count, u64 page_count,
         }
         error = decode_page(record, id, &page);
         if (error == CORE_OK && restore_to) {
-            error = deathboobs_storage_page_write(restore_to, &page);
+            error = deathboobs_storage_tx_page_write(restore_to, &page);
         }
         if (error != CORE_OK) {
             return error;
@@ -245,6 +256,8 @@ ErrorCode journal_restore(const Journal *journal, DeathboobsStorage *storage,
 {
     FileHandle file = NULL;
     u64 count;
+    u64 baseline;
+    u64 final_count;
     u64 position;
     ErrorCode error = file_open(&journal->path, FILE_OPEN_MODE_READ, 0, &file);
     if (error == CORE_NOT_FOUND) {
@@ -255,10 +268,10 @@ ErrorCode journal_restore(const Journal *journal, DeathboobsStorage *storage,
         return error;
     }
     *out_found = true;
-    error = read_header(file, journal, &count);
+    error = read_header(file, journal, &baseline, &count, &final_count);
     if (error == CORE_OK) {
         /* Validate the entire journal before restoring even the first page. */
-        error = visit_records(file, count, journal->page_count, NULL);
+        error = visit_records(file, count, baseline, NULL);
     }
     if (error == CORE_OK) {
         /* A preceding process may have died between rename and directory fsync. */
@@ -272,7 +285,10 @@ ErrorCode journal_restore(const Journal *journal, DeathboobsStorage *storage,
         }
     }
     if (error == CORE_OK) {
-        error = visit_records(file, count, journal->page_count, storage);
+        error = visit_records(file, count, baseline, storage);
+    }
+    if (error == CORE_OK) {
+        error = deathboobs_storage_tx_resize(storage, baseline);
     }
     if (error == CORE_OK) {
         error = deathboobs_storage_flush(storage);

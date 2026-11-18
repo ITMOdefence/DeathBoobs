@@ -8,7 +8,9 @@ DeathBoobs — специализированная встраиваемая б�
 
 ## Статус
 
-Проект находится на этапе проектирования.
+Реализован первый интегрированный вариант: собственный постраничный файл,
+модели записей и little-endian кодеки, Database API с индексами в памяти,
+атомарные транзакции с журналом и восстановление после сбоя.
 
 ## Первая версия
 
@@ -38,15 +40,37 @@ DeathBoobs — специализированная встраиваемая б�
 - [Архитектура](docs/architecture.md)
 - [Распределение работы](docs/work-plan.md)
 - [Файловое хранилище](docs/storage.md)
+- [Модели и формат записей](docs/records.md)
+- [Database API, индексы и интеграция](docs/database.md)
 - [Транзакции и восстановление](docs/transactions.md)
+- [Проверка требований части 2](docs/part2-review.md)
 
 ## Реализация
 
-Проект реализуется на C11 поверх системных библиотек PUNos. Для открытия базы с восстановлением используется `deathboobs_transaction_open()`.
+Проект реализуется на C11 поверх системных библиотек PUNos. Database использует
+только публичные Storage/Transaction API и `libmem`, без прямого доступа к файлу.
+
+## Проверка
+
+Для 64-битного хоста с C11-компилятором и checkout PUNos в соседнем `../PUNos`:
 
 ```sh
-make all PUNOS_DIR=/path/to/PUNos
-make check PUNOS_DIR=/path/to/PUNos
+sh tests/run.sh
+make check-host PUNOS_DIR=/path/to/PUNos
+```
+
+Другой путь к PUNos задаётся через `PUNOS_ROOT`. Сборка использует настоящие
+PUNos-заголовки и `-Wall -Wextra -Werror`. Перед unit tests проверяются production
+объекты freestanding при `-O0` и `-O2`: допустимы только публичные зависимости,
+скрытые ссылки на libc `memcpy`/`memset` отклоняются. Нужны также `nm` и POSIX
+shell/awk. Тестовые объекты и бинарники создаются во временном каталоге вне
+репозитория и автоматически удаляются. Инструмент проверки символов можно
+выбрать через `NM`.
+
+С AddressSanitizer и UndefinedBehaviorSanitizer:
+
+```sh
+CC=clang DEATHBOOBS_SANITIZE=1 sh tests/run.sh
 ```
 
 ## Лицензия

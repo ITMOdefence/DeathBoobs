@@ -6,6 +6,7 @@
 
 #ifdef DEATHBOOBS_NATIVE_TEST
 #include <punos/syscall/syscall.h>
+#include "../../src/internal/storage_internal.h"
 
 typedef enum CrashPoint {
     NO_CRASH,
@@ -15,8 +16,8 @@ typedef enum CrashPoint {
 
 static CrashPoint crash_point;
 ErrorCode __real_file_remove(const String *path);
-ErrorCode __real_deathboobs_storage_page_write(DeathboobsStorage *storage,
-                                              const DeathboobsPage *page);
+ErrorCode __real_deathboobs_storage_tx_page_write(DeathboobsStorage *storage,
+                                                  const DeathboobsPage *page);
 
 ErrorCode __wrap_file_remove(const String *path)
 {
@@ -26,10 +27,10 @@ ErrorCode __wrap_file_remove(const String *path)
     return __real_file_remove(path);
 }
 
-ErrorCode __wrap_deathboobs_storage_page_write(DeathboobsStorage *storage,
-                                              const DeathboobsPage *page)
+ErrorCode __wrap_deathboobs_storage_tx_page_write(DeathboobsStorage *storage,
+                                                  const DeathboobsPage *page)
 {
-    ErrorCode error = __real_deathboobs_storage_page_write(storage, page);
+    ErrorCode error = __real_deathboobs_storage_tx_page_write(storage, page);
     if (error == CORE_OK && crash_point == AFTER_FIRST_WRITE) {
         exit(42);
     }

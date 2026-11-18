@@ -216,6 +216,28 @@ ErrorCode memory_free(MemoryBlock *block)
     return CORE_OK;
 }
 
+ErrorCode memory_reallocate(MemoryBlock *block, usize new_size)
+{
+    MemoryBlock replacement = {0};
+    usize copy_size;
+    usize i;
+    ErrorCode error;
+    if (!block || (!block->data && block->size != 0)) return CORE_INVALID_ARGUMENT;
+    if (new_size == block->size) return CORE_OK;
+    if (new_size == 0) return memory_free(block);
+    error = memory_allocate(new_size, &replacement);
+    if (error != CORE_OK) return error;
+    copy_size = block->size < new_size ? block->size : new_size;
+    for (i = 0; i < copy_size; ++i) replacement.data[i] = block->data[i];
+    error = memory_free(block);
+    if (error != CORE_OK) {
+        (void)memory_free(&replacement);
+        return error;
+    }
+    *block = replacement;
+    return CORE_OK;
+}
+
 ErrorCode string_from_c_str(const char *source, String *out_string)
 {
     usize length = 0;
@@ -272,6 +294,29 @@ ErrorCode deathboobs_writer_unlock(DeathboobsWriterLock *lock)
 {
     files[lock->fd].locked = false;
     lock->fd = -1;
+    return CORE_OK;
+}
+
+ErrorCode deathboobs_writer_resize(DeathboobsWriterLock *lock, u64 byte_size)
+{
+    FakeFile *file;
+    if (!lock || lock->fd < 0 || (usize)lock->fd >= FAKE_FILE_COUNT ||
+        byte_size > FAKE_FILE_CAPACITY) {
+        return CORE_INVALID_ARGUMENT;
+    }
+    file = &files[lock->fd];
+    if (!file->locked) {
+        return CORE_INVALID_STATE;
+    }
+    if (byte_size > file->size) {
+        for (u64 i = file->size; i < byte_size; ++i) {
+            file->data[i] = 0;
+        }
+    }
+    file->size = byte_size;
+    if (file->handle.position > byte_size) {
+        file->handle.position = byte_size;
+    }
     return CORE_OK;
 }
 

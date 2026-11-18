@@ -3,11 +3,13 @@
 
 #include "journal.h"
 #include "../internal/page_codec.h"
+#include "../internal/storage_internal.h"
 
 typedef struct PendingPage {
     struct PendingPage *next;
     MemoryBlock self;
     DeathboobsPage new_page;
+    bool appended;
 } PendingPage;
 
 typedef enum TransactionPhase {
@@ -25,10 +27,13 @@ struct DeathboobsTransaction {
     Journal *journal;
     PendingPage *pages;
     u64 count;
+    u64 original_count;
+    u64 append_count;
     TransactionPhase phase;
     bool stage_owned;
     bool published;
     bool publish_synced;
+    bool storage_owned;
 };
 
 /* The project exposes one active transaction or recovery per process.
@@ -59,6 +64,13 @@ static ErrorCode release_transaction(DeathboobsTransaction **transaction)
             return error;
         }
         tx->pages = next;
+    }
+    if (tx->storage_owned) {
+        ErrorCode end = deathboobs_storage_tx_end(tx->storage);
+        if (end != CORE_OK) {
+            return end;
+        }
+        tx->storage_owned = false;
     }
     MemoryBlock block = tx->self;
     ErrorCode error = memory_free(&block);
@@ -115,14 +127,21 @@ ErrorCode deathboobs_transaction_begin(DeathboobsStorage *storage,
     if (error == CORE_OK) {
         error = memory_allocate(sizeof(DeathboobsTransaction), &block);
     }
+    if (error == CORE_OK) {
+        error = deathboobs_storage_tx_begin(storage);
+    }
     if (error != CORE_OK) {
+        if (block.data) {
+            (void)memory_free(&block);
+        }
         release_writer();
         return error;
     }
 
     DeathboobsTransaction *tx = (DeathboobsTransaction *)block.data;
     *tx = (DeathboobsTransaction){
-        .self = block, .storage = storage, .journal = journal
+        .self = block, .storage = storage, .journal = journal,
+        .storage_owned = true
     };
     *out_transaction = tx;
     return CORE_OK;
@@ -161,9 +180,52 @@ ErrorCode deathboobs_transaction_page_write(DeathboobsTransaction *tx,
         return error;
     }
     PendingPage *entry = (PendingPage *)block.data;
-    *entry = (PendingPage){ *slot, block, *page };
+    *entry = (PendingPage){ .next = *slot, .self = block, .new_page = *page };
     *slot = entry;
     ++tx->count;
+    ++tx->original_count;
+    return CORE_OK;
+}
+
+ErrorCode deathboobs_transaction_page_append(DeathboobsTransaction *tx,
+                                             const DeathboobsPage *page,
+                                             DeathboobsPageId *out_page_id)
+{
+    MemoryBlock block = {0};
+    DeathboobsPage staged;
+    PendingPage **slot;
+    DeathboobsPageId id;
+    ErrorCode error;
+    if (!tx || !page || !out_page_id) {
+        return CORE_INVALID_ARGUMENT;
+    }
+    if (tx->phase != TX_STAGING) {
+        return CORE_INVALID_STATE;
+    }
+    if (!page_type_valid(page->type) ||
+        page->payload_size > DEATHBOOBS_PAGE_PAYLOAD_SIZE) {
+        return CORE_INVALID_ARGUMENT;
+    }
+    if (tx->journal->page_count > (u64)0xffffffffffffffffULL - tx->append_count - 1) {
+        return CORE_OVERFLOW;
+    }
+    id = tx->journal->page_count + tx->append_count + 1;
+    staged = *page;
+    staged.id = id;
+    error = memory_allocate(sizeof(PendingPage), &block);
+    if (error != CORE_OK) {
+        return error;
+    }
+    slot = &tx->pages;
+    while (*slot) {
+        slot = &(*slot)->next;
+    }
+    PendingPage *entry = (PendingPage *)block.data;
+    *entry = (PendingPage){.self = block, .new_page = staged, .appended = true};
+    *slot = entry;
+    ++tx->count;
+    ++tx->append_count;
+    *out_page_id = id;
     return CORE_OK;
 }
 
@@ -179,11 +241,15 @@ static ErrorCode prepare_journal(DeathboobsTransaction *tx)
     if (error != CORE_OK) {
         return error;
     }
-    error = journal_write_header(stage, tx->journal, tx->count);
+    error = journal_write_header(stage, tx->journal, tx->original_count,
+                                 tx->journal->page_count + tx->append_count);
     for (PendingPage *page = tx->pages; page && error == CORE_OK; page = page->next) {
-        error = deathboobs_storage_page_read(tx->storage, page->new_page.id, &original);
-        if (error == CORE_OK) {
-            error = journal_write_page(stage, &original);
+        if (!page->appended) {
+            error = deathboobs_storage_page_read(tx->storage, page->new_page.id,
+                                                 &original);
+            if (error == CORE_OK) {
+                error = journal_write_page(stage, &original);
+            }
         }
     }
     if (error == CORE_OK) {
@@ -211,8 +277,12 @@ static ErrorCode apply_changes(DeathboobsTransaction *tx)
         error = journal_sync_directory(tx->journal);
         tx->publish_synced = error == CORE_OK;
     }
+    if (error == CORE_OK && tx->append_count != 0) {
+        error = deathboobs_storage_tx_resize(
+            tx->storage, tx->journal->page_count + tx->append_count);
+    }
     for (PendingPage *page = tx->pages; page && error == CORE_OK; page = page->next) {
-        error = deathboobs_storage_page_write(tx->storage, &page->new_page);
+        error = deathboobs_storage_tx_page_write(tx->storage, &page->new_page);
     }
     return error == CORE_OK ? deathboobs_storage_flush(tx->storage) : error;
 }
@@ -295,6 +365,11 @@ ErrorCode deathboobs_transaction_recover(DeathboobsStorage *storage,
     if (!acquire_writer()) {
         return CORE_WOULD_BLOCK;
     }
+    ErrorCode begin = deathboobs_storage_tx_begin(storage);
+    if (begin != CORE_OK) {
+        release_writer();
+        return begin;
+    }
     ErrorCode error = journal_init(journal, storage, journal_path);
     if (error == CORE_OK) {
         error = journal_restore(journal, storage, &found);
@@ -305,6 +380,21 @@ ErrorCode deathboobs_transaction_recover(DeathboobsStorage *storage,
     if (error == CORE_OK) {
         error = remove_and_sync(journal, &journal->stage);
     }
+    ErrorCode end = deathboobs_storage_tx_end(storage);
+    if (error == CORE_OK) {
+        error = end;
+    }
     release_writer();
     return error;
+}
+
+ErrorCode deathboobs_transaction_can_rollback(
+    const DeathboobsTransaction *transaction, bool *out_can_rollback)
+{
+    if (!transaction || !out_can_rollback) {
+        return CORE_INVALID_ARGUMENT;
+    }
+    *out_can_rollback = transaction->phase != TX_COMMIT_CLEANUP &&
+                        transaction->phase != TX_RELEASE_COMMIT;
+    return CORE_OK;
 }

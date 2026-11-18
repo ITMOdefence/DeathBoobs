@@ -11,5 +11,6 @@ typedef struct DeathboobsWriterLock {
 
 ErrorCode deathboobs_writer_lock(const String *path, DeathboobsWriterLock *out_lock);
 ErrorCode deathboobs_writer_unlock(DeathboobsWriterLock *lock);
+ErrorCode deathboobs_writer_resize(DeathboobsWriterLock *lock, u64 byte_size);
 
 #endif

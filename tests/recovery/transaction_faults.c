@@ -12,7 +12,7 @@
 #define JOURNAL DB ".journal"
 #define STAGE JOURNAL ".tmp"
 #define DIR "/tmp/"
-#define HEADER_SIZE 56
+#define HEADER_SIZE 64
 #define STR(literal) {literal, sizeof(literal) - 1}
 
 static const String database = STR(DB);
@@ -199,7 +199,7 @@ static void damage_journal(Damage damage)
 
     switch (damage) {
     case BAD_HEADER_CRC:
-        overwrite(file, 52, (Bytes){&byte, 1});
+        overwrite(file, 60, (Bytes){&byte, 1});
         break;
     case BAD_RECORD_CRC:
         overwrite(file, HEADER_SIZE + DEATHBOOBS_PAGE_SIZE + 32, (Bytes){&byte, 1});
@@ -216,8 +216,8 @@ static void damage_journal(Damage damage)
         } else {
             put_u64_le(header + 40, USIZE_MAX);
         }
-        put_u32_le(header + 48, 0);
-        put_u32_le(header + 48, crc32(header, sizeof(header)));
+        put_u32_le(header + 56, 0);
+        put_u32_le(header + 56, crc32(header, sizeof(header)));
         overwrite(file, 0, (Bytes){header, sizeof(header)});
         break;
     }
@@ -316,6 +316,27 @@ static void test_commit_retry(void)
     EXPECT(99, file_remove(&database) == CORE_OK);
 }
 
+static void test_append_rollback_truncates(void)
+{
+    DeathboobsStorage *storage = new_database(&database);
+    DeathboobsTransaction *tx = NULL;
+    DeathboobsPage appended = page_at(0, 44);
+    DeathboobsPage page;
+    DeathboobsPageId id = 0;
+    u64 count = 0;
+    EXPECT(101, deathboobs_transaction_begin(storage, NULL, &tx) == CORE_OK);
+    EXPECT(102, deathboobs_transaction_page_append(tx, &appended, &id) == CORE_OK &&
+                id == 3);
+    fake_fail(FAKE_WRITE, DB, 1, CORE_TIMEOUT, 24);
+    EXPECT(103, deathboobs_transaction_commit(&tx) == CORE_TIMEOUT && tx);
+    EXPECT(104, deathboobs_storage_page_count(storage, &count) == CORE_OK && count == 3);
+    EXPECT(105, deathboobs_transaction_rollback(&tx) == CORE_OK && !tx);
+    EXPECT(106, deathboobs_storage_page_count(storage, &count) == CORE_OK && count == 2);
+    EXPECT(107, deathboobs_storage_page_read(storage, 3, &page) == CORE_NOT_FOUND);
+    EXPECT(108, deathboobs_storage_close(&storage) == CORE_OK);
+    EXPECT(109, file_remove(&database) == CORE_OK && fake_no_resources());
+}
+
 int main(void)
 {
     test_commit_fault_matrix();
@@ -333,6 +354,7 @@ int main(void)
     test_foreign_journal();
     test_primary_and_cleanup_errors();
     test_commit_retry();
+    test_append_rollback_truncates();
     EXPECT(100, fake_no_resources());
     check_passed();
     return 0;

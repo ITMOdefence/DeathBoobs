@@ -57,3 +57,12 @@ ErrorCode deathboobs_writer_unlock(DeathboobsWriterLock *lock)
     lock->fd = -1;
     return close(fd) == 0 ? CORE_OK : core_error_from_errno(errno);
 }
+
+ErrorCode deathboobs_writer_resize(DeathboobsWriterLock *lock, u64 byte_size)
+{
+    if (!lock || lock->fd < 0 || byte_size > (u64)ISIZE_MAX) {
+        return CORE_INVALID_ARGUMENT;
+    }
+    return ftruncate(lock->fd, (off_t)byte_size) == 0
+               ? CORE_OK : core_error_from_errno(errno);
+}

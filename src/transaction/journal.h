@@ -6,7 +6,7 @@
 
 /* Maximum pathname size including NUL on the PUNos Linux target. */
 #define JOURNAL_PATH_CAPACITY ((usize)4096)
-#define JOURNAL_HEADER_SIZE ((usize)56)
+#define JOURNAL_HEADER_SIZE ((usize)64)
 #define JOURNAL_MAX_RECORDS (((u64)ISIZE_MAX - JOURNAL_HEADER_SIZE) / DEATHBOOBS_PAGE_SIZE)
 
 typedef struct Journal {
@@ -25,7 +25,8 @@ ErrorCode journal_check_absent(const String *path);
 ErrorCode journal_remove(const String *path);
 ErrorCode journal_sync_directory(const Journal *journal);
 ErrorCode journal_close(FileHandle *file, ErrorCode primary);
-ErrorCode journal_write_header(FileHandle file, const Journal *journal, u64 count);
+ErrorCode journal_write_header(FileHandle file, const Journal *journal,
+                               u64 original_count, u64 final_page_count);
 ErrorCode journal_write_page(FileHandle file, const DeathboobsPage *page);
 ErrorCode journal_restore(const Journal *journal, DeathboobsStorage *storage,
                           bool *out_found);
