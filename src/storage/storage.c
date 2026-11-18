@@ -3,89 +3,23 @@
 #include <sys/file.h>
 #include <sys/memory.h>
 
+#include "../internal/page_codec.h"
+#include "../internal/writer_lock.h"
+
 #define FILE_HEADER_SIZE ((u32)32)
 #define FILE_HEADER_CRC_OFFSET ((usize)28)
-#define PAGE_CRC_OFFSET ((usize)24)
-#define PAGE_RESERVED_OFFSET ((usize)28)
 #define MAX_FILE_OFFSET ((u64)0x7fffffffffffffffULL)
 
 struct DeathboobsStorage {
     MemoryBlock self;
     FileHandle file;
+    DeathboobsWriterLock lock;
+    String path;
     u64 page_count;
     u8 scratch[DEATHBOOBS_PAGE_SIZE];
 };
 
 static const u8 FILE_MAGIC[8] = {'D', 'E', 'A', 'T', 'H', 'D', 'B', 0};
-
-static void put_u16_le(u8 *out, u16 value)
-{
-    out[0] = (u8)value;
-    out[1] = (u8)(value >> 8);
-}
-
-static void put_u32_le(u8 *out, u32 value)
-{
-    out[0] = (u8)value;
-    out[1] = (u8)(value >> 8);
-    out[2] = (u8)(value >> 16);
-    out[3] = (u8)(value >> 24);
-}
-
-static void put_u64_le(u8 *out, u64 value)
-{
-    usize i;
-    for (i = 0; i < 8; ++i) {
-        out[i] = (u8)(value >> (i * 8));
-    }
-}
-
-static u16 get_u16_le(const u8 *in)
-{
-    return (u16)((u16)in[0] | ((u16)in[1] << 8));
-}
-
-static u32 get_u32_le(const u8 *in)
-{
-    return (u32)in[0] | ((u32)in[1] << 8) | ((u32)in[2] << 16) |
-           ((u32)in[3] << 24);
-}
-
-static u64 get_u64_le(const u8 *in)
-{
-    u64 value = 0;
-    usize i;
-    for (i = 0; i < 8; ++i) {
-        value |= (u64)in[i] << (i * 8);
-    }
-    return value;
-}
-
-static bool bytes_are_zero(const u8 *data, usize size)
-{
-    usize i;
-    for (i = 0; i < size; ++i) {
-        if (data[i] != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static u32 crc32(const u8 *data, usize size)
-{
-    u32 crc = 0xffffffffU;
-    usize i;
-    u8 bit;
-    for (i = 0; i < size; ++i) {
-        crc ^= data[i];
-        for (bit = 0; bit < 8; ++bit) {
-            u32 mask = (u32)-(i32)(crc & 1U);
-            crc = (crc >> 1) ^ (0xedb88320U & mask);
-        }
-    }
-    return ~crc;
-}
 
 static ErrorCode seek_page(FileHandle file, DeathboobsPageId page_id)
 {
@@ -183,81 +117,6 @@ static ErrorCode validate_file_header(u8 *header)
     return stored_crc == actual_crc ? CORE_OK : CORE_IO_ERROR;
 }
 
-static bool page_type_valid(DeathboobsPageType type)
-{
-    return type >= DEATHBOOBS_PAGE_TYPE_METADATA &&
-           type <= DEATHBOOBS_PAGE_TYPE_INDEX_RESERVED;
-}
-
-static ErrorCode encode_page(const DeathboobsPage *page, u8 *out)
-{
-    usize i;
-    if (!page || !page_type_valid(page->type) ||
-        page->payload_size > DEATHBOOBS_PAGE_PAYLOAD_SIZE) {
-        return CORE_INVALID_ARGUMENT;
-    }
-    for (i = 0; i < DEATHBOOBS_PAGE_SIZE; ++i) {
-        out[i] = 0;
-    }
-    put_u64_le(out, page->id);
-    put_u16_le(out + 8, (u16)page->type);
-    put_u16_le(out + 10, page->flags);
-    put_u32_le(out + 12, page->payload_size);
-    put_u64_le(out + 16, page->generation);
-    for (i = 0; i < page->payload_size; ++i) {
-        out[DEATHBOOBS_PAGE_HEADER_SIZE + i] = page->payload[i];
-    }
-    put_u32_le(out + PAGE_CRC_OFFSET, 0);
-    put_u32_le(out + PAGE_CRC_OFFSET, crc32(out, DEATHBOOBS_PAGE_SIZE));
-    return CORE_OK;
-}
-
-static ErrorCode decode_page(u8 *input, DeathboobsPageId expected_id,
-                             DeathboobsPage *out)
-{
-    DeathboobsPage page;
-    u16 raw_type;
-    u32 stored_crc;
-    u32 actual_crc;
-    usize i;
-    if (!out) {
-        return CORE_INVALID_ARGUMENT;
-    }
-    if (get_u64_le(input) != expected_id) {
-        return CORE_IO_ERROR;
-    }
-    raw_type = get_u16_le(input + 8);
-    if (raw_type < DEATHBOOBS_PAGE_TYPE_METADATA ||
-        raw_type > DEATHBOOBS_PAGE_TYPE_INDEX_RESERVED) {
-        return CORE_IO_ERROR;
-    }
-    page.id = expected_id;
-    page.type = (DeathboobsPageType)raw_type;
-    page.flags = get_u16_le(input + 10);
-    page.payload_size = get_u32_le(input + 12);
-    page.generation = get_u64_le(input + 16);
-    if (page.payload_size > DEATHBOOBS_PAGE_PAYLOAD_SIZE ||
-        !bytes_are_zero(input + PAGE_RESERVED_OFFSET, 4) ||
-        !bytes_are_zero(input + DEATHBOOBS_PAGE_HEADER_SIZE + page.payload_size,
-                        DEATHBOOBS_PAGE_PAYLOAD_SIZE - page.payload_size)) {
-        return CORE_IO_ERROR;
-    }
-    stored_crc = get_u32_le(input + PAGE_CRC_OFFSET);
-    put_u32_le(input + PAGE_CRC_OFFSET, 0);
-    actual_crc = crc32(input, DEATHBOOBS_PAGE_SIZE);
-    put_u32_le(input + PAGE_CRC_OFFSET, stored_crc);
-    if (stored_crc != actual_crc) {
-        return CORE_IO_ERROR;
-    }
-    for (i = 0; i < DEATHBOOBS_PAGE_PAYLOAD_SIZE; ++i) {
-        page.payload[i] = i < page.payload_size
-                              ? input[DEATHBOOBS_PAGE_HEADER_SIZE + i]
-                              : 0;
-    }
-    *out = page;
-    return CORE_OK;
-}
-
 static ErrorCode storage_cleanup(DeathboobsStorage *storage,
                                  ErrorCode primary)
 {
@@ -271,6 +130,16 @@ static ErrorCode storage_cleanup(DeathboobsStorage *storage,
         if (primary == CORE_OK && error != CORE_OK) {
             primary = error;
         }
+    }
+    if (storage->lock.fd >= 0) {
+        error = deathboobs_writer_unlock(&storage->lock);
+        if (primary == CORE_OK) {
+            primary = error;
+        }
+    }
+    error = string_destroy(&storage->path);
+    if (primary == CORE_OK) {
+        primary = error;
     }
     block = storage->self;
     error = memory_free(&block);
@@ -297,6 +166,14 @@ ErrorCode deathboobs_storage_open(const String *path,
     storage = (DeathboobsStorage *)block.data;
     *storage = (DeathboobsStorage){0};
     storage->self = block;
+    storage->lock.fd = -1;
+    error = string_copy(path, &storage->path);
+    if (error == CORE_OK) {
+        error = deathboobs_writer_lock(path, &storage->lock);
+    }
+    if (error != CORE_OK) {
+        return storage_cleanup(storage, error);
+    }
     error = file_open(path, FILE_OPEN_MODE_READ_WRITE_CREATE,
                       FILE_DEFAULT_PERMISSIONS, &storage->file);
     if (error != CORE_OK) {
@@ -453,4 +330,17 @@ ErrorCode deathboobs_storage_flush(DeathboobsStorage *storage)
         return CORE_INVALID_STATE;
     }
     return file_flush(storage->file);
+}
+
+ErrorCode deathboobs_storage_file_identity(const DeathboobsStorage *storage,
+                                           u64 *out_device, u64 *out_inode,
+                                           const String **out_path)
+{
+    if (!storage || !out_device || !out_inode || !out_path) {
+        return CORE_INVALID_ARGUMENT;
+    }
+    *out_device = storage->lock.device;
+    *out_inode = storage->lock.inode;
+    *out_path = &storage->path;
+    return CORE_OK;
 }

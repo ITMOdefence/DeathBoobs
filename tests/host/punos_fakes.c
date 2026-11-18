@@ -3,10 +3,13 @@
 #include <sys/memory.h>
 #include <sys/string.h>
 
+#include "../fakes/punos_faults.h"
+#include "../../src/internal/writer_lock.h"
+
 extern void *malloc(usize size);
 extern void free(void *pointer);
 
-#define FAKE_FILE_COUNT ((usize)4)
+#define FAKE_FILE_COUNT ((usize)12)
 #define FAKE_FILE_CAPACITY ((usize)(DEATHBOOBS_PAGE_SIZE * 4))
 #define FAKE_PATH_CAPACITY ((usize)128)
 #define FAKE_READ_CHUNK ((usize)137)
@@ -26,9 +29,112 @@ struct FakeFile {
     u8 data[FAKE_FILE_CAPACITY];
     u64 size;
     struct FileHandle handle;
+    bool locked;
+    u64 inode;
+    bool durable_exists;
+    char durable_path[FAKE_PATH_CAPACITY];
+    usize durable_path_length;
+    u8 durable_data[FAKE_FILE_CAPACITY];
+    u64 durable_size;
 };
 
 static FakeFile files[FAKE_FILE_COUNT];
+static FakeFile saved_files[FAKE_FILE_COUNT];
+static FakeFile directory;
+static u64 next_inode;
+static usize allocations;
+
+typedef struct Fault {
+    FakeOperation operation;
+    const char *path;
+    usize remaining;
+    ErrorCode error;
+    usize partial;
+} Fault;
+
+static Fault faults[4];
+
+static bool text_matches(const char *left, const char *right)
+{
+    if (!left || !right) {
+        return left == right;
+    }
+    while (*left && *left == *right) {
+        ++left;
+        ++right;
+    }
+    return *left == *right;
+}
+
+void fake_fail(FakeOperation operation, const char *path, usize nth,
+               ErrorCode error, usize partial)
+{
+    for (usize i = 0; i < sizeof(faults) / sizeof(faults[0]); ++i) {
+        if (faults[i].remaining == 0) {
+            faults[i] = (Fault){operation, path, nth, error, partial};
+            return;
+        }
+    }
+    __builtin_trap();
+}
+
+static Fault fault_at(FakeOperation operation, const char *path)
+{
+    for (usize i = 0; i < sizeof(faults) / sizeof(faults[0]); ++i) {
+        Fault *fault = &faults[i];
+        if (fault->remaining && fault->operation == operation &&
+            text_matches(fault->path, path) && --fault->remaining == 0) {
+            return *fault;
+        }
+    }
+    return (Fault){0};
+}
+
+bool fake_no_resources(void)
+{
+    if (allocations || directory.handle.open) {
+        return false;
+    }
+    for (usize i = 0; i < FAKE_FILE_COUNT; ++i) {
+        if (files[i].handle.open || files[i].locked) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void fake_capture_disk(bool durable)
+{
+    for (usize i = 0; i < FAKE_FILE_COUNT; ++i) {
+        FakeFile *source = &files[i];
+        FakeFile *saved = &saved_files[i];
+        *saved = *source;
+        saved->handle = (struct FileHandle){0};
+        saved->locked = false;
+        if (durable) {
+            saved->used = source->durable_exists;
+            saved->size = source->durable_size;
+            saved->path_length = source->durable_path_length;
+            for (usize n = 0; n < FAKE_PATH_CAPACITY; ++n) {
+                saved->path[n] = source->durable_path[n];
+            }
+            for (usize n = 0; n < saved->size; ++n) {
+                saved->data[n] = source->durable_data[n];
+            }
+        }
+    }
+}
+
+void fake_restore_disk(void)
+{
+    if (!fake_no_resources()) {
+        __builtin_trap();
+    }
+    for (usize i = 0; i < FAKE_FILE_COUNT; ++i) {
+        files[i] = saved_files[i];
+    }
+}
+
 
 static bool same_path(const FakeFile *file, const String *path)
 {
@@ -63,8 +169,10 @@ static FakeFile *create_file(const String *path)
         return NULL;
     }
     for (i = 0; i < FAKE_FILE_COUNT; ++i) {
-        if (!files[i].used) {
+        if (!files[i].used && !files[i].durable_exists) {
+            files[i] = (FakeFile){0};
             files[i].used = true;
+            files[i].inode = ++next_inode;
             files[i].path_length = path->length;
             files[i].size = 0;
             files[i].handle = (struct FileHandle){0};
@@ -90,6 +198,7 @@ ErrorCode memory_allocate(usize size, MemoryBlock *out_block)
     data = (u8 *)malloc(size);
     if (!data) return CORE_OUT_OF_MEMORY;
     for (i = 0; i < size; ++i) data[i] = 0;
+    ++allocations;
     *out_block = (MemoryBlock){data, size};
     return CORE_OK;
 }
@@ -97,7 +206,12 @@ ErrorCode memory_allocate(usize size, MemoryBlock *out_block)
 ErrorCode memory_free(MemoryBlock *block)
 {
     if (!block || (!block->data && block->size != 0)) return CORE_INVALID_ARGUMENT;
-    if (block->data) free(block->data);
+    if (block->data) {
+        Fault fault = fault_at(FAKE_FREE, NULL);
+        if (fault.error) return fault.error;
+        --allocations;
+        free(block->data);
+    }
     *block = (MemoryBlock){0};
     return CORE_OK;
 }
@@ -112,6 +226,7 @@ ErrorCode string_from_c_str(const char *source, String *out_string)
     copy = (char *)malloc(length + 1);
     if (!copy) return CORE_OUT_OF_MEMORY;
     for (i = 0; i <= length; ++i) copy[i] = source[i];
+    ++allocations;
     *out_string = (String){copy, length};
     return CORE_OK;
 }
@@ -119,8 +234,44 @@ ErrorCode string_from_c_str(const char *source, String *out_string)
 ErrorCode string_destroy(String *string)
 {
     if (!string) return CORE_INVALID_ARGUMENT;
-    if (string->data) free(string->data);
+    if (string->data) {
+        --allocations;
+        free(string->data);
+    }
     *string = (String){0};
+    return CORE_OK;
+}
+
+ErrorCode string_copy(const String *source, String *out)
+{
+    if (!source || !source->data) return CORE_INVALID_ARGUMENT;
+    return string_from_c_str(source->data, out);
+}
+
+void fake_truncate(const char *path, usize size)
+{
+    usize length = 0;
+    while (path[length]) ++length;
+    FakeFile *file = find_file(&(String){(char *)path, length});
+    if (!file || size > file->size) __builtin_trap();
+    file->size = size;
+}
+
+ErrorCode deathboobs_writer_lock(const String *path, DeathboobsWriterLock *out)
+{
+    FakeFile *file = find_file(path);
+    if (!file) file = create_file(path);
+    if (!file) return CORE_IO_ERROR;
+    if (file->locked) return CORE_WOULD_BLOCK;
+    file->locked = true;
+    *out = (DeathboobsWriterLock){(i32)(file - files), 1, file->inode};
+    return CORE_OK;
+}
+
+ErrorCode deathboobs_writer_unlock(DeathboobsWriterLock *lock)
+{
+    files[lock->fd].locked = false;
+    lock->fd = -1;
     return CORE_OK;
 }
 
@@ -132,7 +283,22 @@ ErrorCode file_open(const String *path, FileOpenMode mode, FilePermissions permi
         mode < FILE_OPEN_MODE_READ || mode > FILE_OPEN_MODE_APPEND_CREATE) {
         return CORE_INVALID_ARGUMENT;
     }
+    Fault fault = fault_at(FAKE_OPEN, path->data);
+    if (fault.error) {
+        if (fault.partial && mode == FILE_OPEN_MODE_READ_WRITE_CREATE &&
+            !find_file(path)) {
+            (void)create_file(path);
+        }
+        return fault.error;
+    }
     file = find_file(path);
+    if (!file && mode == FILE_OPEN_MODE_READ &&
+        (text_matches(path->data, ".") || text_matches(path->data, "/tmp/"))) {
+        file = &directory;
+        for (usize i = 0; i <= path->length; ++i) {
+            directory.path[i] = path->data[i];
+        }
+    }
     if (!file) {
         if (mode == FILE_OPEN_MODE_READ) return CORE_NOT_FOUND;
         file = create_file(path);
@@ -150,9 +316,10 @@ ErrorCode file_open(const String *path, FileOpenMode mode, FilePermissions permi
 ErrorCode file_close(FileHandle *file)
 {
     if (!file || !*file || !(*file)->open) return CORE_INVALID_ARGUMENT;
+    Fault fault = fault_at(FAKE_CLOSE, (*file)->owner->path);
     (*file)->open = false;
     *file = NULL;
-    return CORE_OK;
+    return fault.error;
 }
 
 ErrorCode file_read(FileHandle file, Bytes buffer, usize *out_read)
@@ -163,6 +330,8 @@ ErrorCode file_read(FileHandle file, Bytes buffer, usize *out_read)
     if (!file || !file->open || !out_read || (!buffer.data && buffer.size != 0)) {
         return CORE_INVALID_ARGUMENT;
     }
+    Fault fault = fault_at(FAKE_READ, file->owner->path);
+    if (fault.error) return fault.error;
     if (file->position >= file->owner->size) {
         *out_read = 0;
         return CORE_OK;
@@ -182,12 +351,14 @@ ErrorCode file_write_all(FileHandle file, Bytes data)
     if (!file || !file->open || (!data.data && data.size != 0)) {
         return CORE_INVALID_ARGUMENT;
     }
+    Fault fault = fault_at(FAKE_WRITE, file->owner->path);
+    if (fault.error && fault.partial < data.size) data.size = fault.partial;
     if (file->position > FAKE_FILE_CAPACITY ||
         data.size > FAKE_FILE_CAPACITY - file->position) return CORE_IO_ERROR;
     for (i = 0; i < data.size; ++i) file->owner->data[file->position + i] = data.data[i];
     file->position += data.size;
     if (file->position > file->owner->size) file->owner->size = file->position;
-    return CORE_OK;
+    return fault.error;
 }
 
 ErrorCode file_seek(FileHandle file, i64 offset, FileSeekOrigin origin, u64 *out_position)
@@ -212,22 +383,58 @@ ErrorCode file_seek(FileHandle file, i64 offset, FileSeekOrigin origin, u64 *out
 ErrorCode file_info(FileHandle file, FileInfo *out_info)
 {
     if (!file || !file->open || !out_info) return CORE_INVALID_ARGUMENT;
-    *out_info = (FileInfo){file->owner->size, FILE_KIND_REGULAR};
+    *out_info = (FileInfo){file->owner->size,
+                           file->owner == &directory ? FILE_KIND_DIRECTORY : FILE_KIND_REGULAR};
     return CORE_OK;
 }
 
 ErrorCode file_flush(FileHandle file)
 {
-    return file && file->open ? CORE_OK : CORE_INVALID_ARGUMENT;
+    if (!file || !file->open) return CORE_INVALID_ARGUMENT;
+    FakeFile *owner = file->owner;
+    Fault fault = fault_at(FAKE_FLUSH, owner->path);
+    if (fault.error) return fault.error;
+    if (owner == &directory) {
+        for (usize i = 0; i < FAKE_FILE_COUNT; ++i) {
+            files[i].durable_exists = files[i].used;
+            files[i].durable_path_length = files[i].path_length;
+            for (usize n = 0; n < FAKE_PATH_CAPACITY; ++n) {
+                files[i].durable_path[n] = files[i].path[n];
+            }
+        }
+    } else {
+        owner->durable_size = owner->size;
+        for (usize n = 0; n < owner->size; ++n) {
+            owner->durable_data[n] = owner->data[n];
+        }
+    }
+    return CORE_OK;
 }
 
 ErrorCode file_remove(const String *path)
 {
     FakeFile *file;
     if (!path) return CORE_INVALID_ARGUMENT;
+    Fault fault = fault_at(FAKE_REMOVE, path->data);
+    if (fault.error) return fault.error;
     file = find_file(path);
     if (!file) return CORE_NOT_FOUND;
     if (file->handle.open) return CORE_INVALID_STATE;
-    *file = (FakeFile){0};
+    file->used = false;
+    return CORE_OK;
+}
+
+ErrorCode file_rename(const String *old_path, const String *new_path)
+{
+    Fault fault = fault_at(FAKE_RENAME, old_path->data);
+    if (fault.error) return fault.error;
+    FakeFile *file = find_file(old_path);
+    if (!file) return CORE_NOT_FOUND;
+    if (find_file(new_path)) return CORE_ALREADY_EXISTS;
+    if (new_path->length >= FAKE_PATH_CAPACITY) return CORE_OVERFLOW;
+    file->path_length = new_path->length;
+    for (usize i = 0; i <= new_path->length; ++i) {
+        file->path[i] = new_path->data[i];
+    }
     return CORE_OK;
 }

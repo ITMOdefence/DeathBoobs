@@ -6,7 +6,9 @@
 
 typedef struct DeathboobsStorage DeathboobsStorage;
 
-/* Opens an existing database or creates a new one when the file is absent. */
+/* Opens or creates a database, holding an exclusive writer lock until close.
+ * Transactional callers should use deathboobs_transaction_open().
+ */
 ErrorCode deathboobs_storage_open(const String *path,
                                   DeathboobsStorage **out_storage);
 
@@ -33,5 +35,10 @@ ErrorCode deathboobs_storage_page_append(DeathboobsStorage *storage,
 
 /* Pushes all previous writes to the storage device. */
 ErrorCode deathboobs_storage_flush(DeathboobsStorage *storage);
+
+/* Returns the locked file identity and its borrowed opening path. */
+ErrorCode deathboobs_storage_file_identity(const DeathboobsStorage *storage,
+                                           u64 *out_device, u64 *out_inode,
+                                           const String **out_path);
 
 #endif
